@@ -1,0 +1,73 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { calcCommission, resolveUnitPrice } from '../src/common/money';
+import { computeAuditHash, verifyChain, GENESIS_HASH, canonicalize, StoredAudit } from '../src/common/audit-hash';
+import { encrypt, decrypt } from '../src/common/crypto';
+import { isValidCnpj } from '../src/common/cnpj';
+
+test('commission: rounds half up, integer math', () => {
+  assert.equal(calcCommission(10_000, 500), 500);       // 5% of R$100
+  assert.equal(calcCommission(99, 500), 5);             // 4.95 -> 5
+  assert.equal(calcCommission(10, 500), 1);             // 0.5 -> 1 (half up)
+  assert.equal(calcCommission(0, 500), 0);
+  assert.equal(calcCommission(Number.MAX_SAFE_INTEGER, 10_000), Number.MAX_SAFE_INTEGER);
+  assert.throws(() => calcCommission(-1, 500));
+  assert.throws(() => calcCommission(100, 10_001));
+  assert.throws(() => calcCommission(1.5, 500));
+});
+
+test('price tiers: highest applicable tier wins, else base', () => {
+  const tiers = [{ minQty: 10, priceCents: 900 }, { minQty: 50, priceCents: 800 }];
+  assert.equal(resolveUnitPrice(1000, tiers, 1), 1000);
+  assert.equal(resolveUnitPrice(1000, tiers, 10), 900);
+  assert.equal(resolveUnitPrice(1000, tiers, 49), 900);
+  assert.equal(resolveUnitPrice(1000, tiers, 500), 800);
+  assert.throws(() => resolveUnitPrice(1000, tiers, 0));
+});
+
+test('canonicalize is key-order independent', () => {
+  assert.equal(canonicalize({ b: 1, a: { d: 2, c: 3 } }), canonicalize({ a: { c: 3, d: 2 }, b: 1 }));
+});
+
+function build(n: number): StoredAudit[] {
+  const rows: StoredAudit[] = [];
+  let prev = GENESIS_HASH;
+  for (let i = 0; i < n; i++) {
+    const e = { at: `2026-01-0${i + 1}T00:00:00.000Z`, companyId: 'c1', userId: 'u1',
+                action: 'x', entity: 'e', entityId: String(i), payload: { i } };
+    const hash = computeAuditHash(prev, e);
+    rows.push({ ...e, prevHash: prev, hash });
+    prev = hash;
+  }
+  return rows;
+}
+
+test('audit chain verifies and detects tampering', () => {
+  const rows = build(5);
+  assert.equal(verifyChain(rows), -1);
+  const tampered = structuredClone(rows);
+  (tampered[2].payload as { i: number }).i = 999;
+  assert.equal(verifyChain(tampered), 2);
+  const deleted = rows.filter((_, i) => i !== 1);
+  assert.equal(verifyChain(deleted), 1);
+});
+
+test('aes-256-gcm roundtrip and tamper detection', () => {
+  const key = 'a'.repeat(64);
+  const ct = encrypt('JBSWY3DPEHPK3PXP', key);
+  assert.equal(decrypt(ct, key), 'JBSWY3DPEHPK3PXP');
+  assert.notEqual(encrypt('same', key), encrypt('same', key)); // random IV
+  const [iv, tag, body] = ct.split('.');
+  const bad = [iv, tag, Buffer.from('xxxxxxxxxxxxxxxx').toString('base64')].join('.');
+  assert.throws(() => decrypt(bad, key));
+  assert.throws(() => decrypt(ct, 'short'));
+  void body;
+});
+
+test('cnpj validation', () => {
+  assert.equal(isValidCnpj('11.222.333/0001-81'), true);
+  assert.equal(isValidCnpj('11222333000181'), true);
+  assert.equal(isValidCnpj('11222333000182'), false);
+  assert.equal(isValidCnpj('00000000000000'), false);
+  assert.equal(isValidCnpj('123'), false);
+});
