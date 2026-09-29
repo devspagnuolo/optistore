@@ -1,0 +1,50 @@
+import {
+  BadRequestException, Controller, Get, Headers, HttpCode, Module, Param, ParseUUIDPipe, Patch, Post, Req, UnauthorizedException,
+} from '@nestjs/common';
+import { SkipThrottle } from '@nestjs/throttler';
+import { createHmac, timingSafeEqual } from 'node:crypto';
+import { AuthUser, CurrentUser, Public, Roles } from '../../common/auth.types';
+import { ConfigService } from '../../common/config';
+import { OrdersService } from './orders.service';
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+@Controller('orders')
+export class OrdersController {
+  constructor(private svc: OrdersService) {}
+  @Get() list(@CurrentUser() u: AuthUser) { return this.svc.list(u); }
+  @Get(':id') get(@CurrentUser() u: AuthUser, @Param('id', ParseUUIDPipe) id: string) { return this.svc.get(u, id); }
+  @Roles('seller') @Patch(':id/ship') ship(@CurrentUser() u: AuthUser, @Param('id', ParseUUIDPipe) id: string) { return this.svc.ship(u, id); }
+  @Roles('buyer') @Patch(':id/deliver') deliver(@CurrentUser() u: AuthUser, @Param('id', ParseUUIDPipe) id: string) { return this.svc.deliver(u, id); }
+}
+
+/**
+ * PSP webhook contract (provider-agnostic; adapt when the payment facilitator is chosen):
+ *   POST /webhooks/payments   header: x-signature = hex(HMAC_SHA256(rawBody, PAYMENT_WEBHOOK_SECRET))
+ *   body: { "orderId": uuid, "gatewayRef": string, "amountCents": integer }
+ */
+@Controller('webhooks')
+export class WebhooksController {
+  constructor(private svc: OrdersService, private cfg: ConfigService) {}
+
+  @Public() @SkipThrottle() @HttpCode(200) @Post('payments')
+  async payments(@Req() req: { rawBody?: Buffer }, @Headers('x-signature') sig?: string) {
+    const raw = req.rawBody;
+    if (!raw || !sig) throw new UnauthorizedException();
+    const expected = createHmac('sha256', this.cfg.cfg.paymentWebhookSecret).update(raw).digest();
+    const given = Buffer.from(sig, 'hex');
+    if (given.length !== expected.length || !timingSafeEqual(given, expected)) throw new UnauthorizedException();
+
+    let body: { orderId?: unknown; gatewayRef?: unknown; amountCents?: unknown };
+    try { body = JSON.parse(raw.toString('utf8')); } catch { throw new BadRequestException('JSON inválido'); }
+    if (typeof body.orderId !== 'string' || !UUID_RE.test(body.orderId)
+        || typeof body.gatewayRef !== 'string' || body.gatewayRef.length < 1 || body.gatewayRef.length > 128
+        || !Number.isSafeInteger(body.amountCents) || (body.amountCents as number) < 0) {
+      throw new BadRequestException('Payload inválido');
+    }
+    return this.svc.confirmPayment(body.orderId, body.gatewayRef, body.amountCents as number);
+  }
+}
+
+@Module({ controllers: [OrdersController, WebhooksController], providers: [OrdersService], exports: [OrdersService] })
+export class OrdersModule {}
