@@ -1,0 +1,44 @@
+import { Body, Controller, Get, Module, NotFoundException, Param, ParseUUIDPipe, Patch, Query } from '@nestjs/common';
+import { IsIn } from 'class-validator';
+import { AuthUser, CurrentUser, PlatformAdminOnly } from '../../common/auth.types';
+import { DatabaseService } from '../../database/database.service';
+import { AuditService } from '../audit/audit.service';
+
+class SetStatusDto { @IsIn(['active', 'suspended']) status: 'active' | 'suspended'; }
+
+@Controller()
+export class CompaniesController {
+  constructor(private db: DatabaseService, private audit: AuditService) {}
+
+  @Get('companies/me')
+  me(@CurrentUser() u: AuthUser) {
+    return this.db.tx(u, async (c) => {
+      const r = await c.query('SELECT id, type, legal_name, trade_name, cnpj, status, plan FROM companies WHERE id = $1', [u.companyId]);
+      return r.rows[0];
+    });
+  }
+
+  /** Admin Master (MVP slice): KYC review queue. Platform-admin + MFA enforced at login. */
+  @PlatformAdminOnly() @Get('admin/companies')
+  list(@CurrentUser() u: AuthUser, @Query('status') status = 'pending_kyc') {
+    return this.db.tx({ userId: u.userId, system: true }, async (c) => {
+      const r = await c.query(
+        `SELECT id, type, legal_name, trade_name, cnpj, status, created_at
+           FROM companies WHERE status = $1::company_status ORDER BY created_at LIMIT 100`, [status]);
+      return r.rows;
+    });
+  }
+
+  @PlatformAdminOnly() @Patch('admin/companies/:id/status')
+  setStatus(@CurrentUser() u: AuthUser, @Param('id', ParseUUIDPipe) id: string, @Body() dto: SetStatusDto) {
+    return this.db.tx({ userId: u.userId, system: true }, async (c) => {
+      const r = await c.query(`UPDATE companies SET status = $2 WHERE id = $1 RETURNING id, status`, [id, dto.status]);
+      if (!r.rows[0]) throw new NotFoundException();
+      await this.audit.record(c, { companyId: id, userId: u.userId }, 'admin.company_status', 'company', id, { status: dto.status });
+      return r.rows[0];
+    });
+  }
+}
+
+@Module({ controllers: [CompaniesController] })
+export class CompaniesModule {}
