@@ -1,0 +1,66 @@
+import { BadRequestException, Body, Controller, Get, Injectable, Module, Post } from '@nestjs/common';
+import { IsIn, IsInt, IsOptional, IsString, IsUUID, MaxLength } from 'class-validator';
+import { AuthUser, CurrentUser, Roles } from '../../common/auth.types';
+import { assertActiveCompany } from '../../common/company-guard';
+import { DatabaseService } from '../../database/database.service';
+import { AuditService } from '../audit/audit.service';
+
+export class MovementDto {
+  @IsUUID() variantId: string;
+  @IsIn(['in', 'out', 'adjust']) type: 'in' | 'out' | 'adjust';
+  /** in/out: positive amount. adjust: signed, non-zero. */
+  @IsInt() quantity: number;
+  @IsOptional() @IsString() @MaxLength(500) note?: string;
+}
+
+@Injectable()
+export class InventoryService {
+  constructor(private db: DatabaseService, private audit: AuditService) {}
+
+  move(u: AuthUser, dto: MovementDto) {
+    if (dto.quantity === 0) throw new BadRequestException('Quantidade não pode ser zero');
+    if (dto.type !== 'adjust' && dto.quantity < 0) throw new BadRequestException('Use quantidade positiva para entrada/saída');
+    const signed = dto.type === 'out' ? -dto.quantity : dto.quantity;
+    return this.db.tx(u, async (c) => {
+      await assertActiveCompany(c, u.companyId);
+      // Variant must be visible to this tenant (own, or published by a supplier) — RLS applies here.
+      const v = await c.query('SELECT 1 FROM product_variants WHERE id = $1', [dto.variantId]);
+      if (!v.rows[0]) throw new BadRequestException('Variante inexistente');
+      // Serialize concurrent movements per (company, variant) so the never-negative check is race-free.
+      await c.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`stock:${u.companyId}:${dto.variantId}`]);
+      const cur = await c.query<{ on_hand: number }>(
+        `SELECT COALESCE(SUM(quantity), 0)::int AS on_hand FROM stock_movements WHERE company_id = $1 AND variant_id = $2`,
+        [u.companyId, dto.variantId]);
+      if (cur.rows[0].on_hand + signed < 0) throw new BadRequestException('Estoque insuficiente');
+      const m = await c.query<{ id: number }>(
+        `INSERT INTO stock_movements (company_id, variant_id, type, quantity, note, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+        [u.companyId, dto.variantId, dto.type, signed, dto.note ?? null, u.userId]);
+      await this.audit.record(c, u, 'inventory.movement', 'variant', dto.variantId, { type: dto.type, qty: signed });
+      return { id: m.rows[0].id, onHand: cur.rows[0].on_hand + signed };
+    });
+  }
+
+  levels(u: AuthUser) {
+    return this.db.tx(u, async (c) => {
+      const r = await c.query(
+        `SELECT l.variant_id, v.sku, p.name, l.on_hand, l.reserved, (l.on_hand - l.reserved) AS available
+           FROM stock_levels l
+           JOIN product_variants v ON v.id = l.variant_id
+           JOIN products p ON p.id = v.product_id
+          WHERE l.company_id = $1 ORDER BY p.name, v.sku LIMIT 500`, [u.companyId]);
+      return r.rows;
+    });
+  }
+}
+
+@Controller('inventory')
+export class InventoryController {
+  constructor(private svc: InventoryService) {}
+  @Roles('seller', 'buyer') @Post('movements')
+  move(@CurrentUser() u: AuthUser, @Body() dto: MovementDto) { return this.svc.move(u, dto); }
+  @Get('levels') levels(@CurrentUser() u: AuthUser) { return this.svc.levels(u); }
+}
+
+@Module({ controllers: [InventoryController], providers: [InventoryService] })
+export class InventoryModule {}
